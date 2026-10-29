@@ -19,6 +19,8 @@ class handDetector():
         self._start_time = time.monotonic()
         self.timestamp_ms = 0
         self._last_timestamp_ms = -1
+        self.results = None
+        self.lmList = []
         self.handedness = None
         self.last_error = None
         self.debug_api = None
@@ -56,33 +58,11 @@ class handDetector():
             self.results = None
             return img
         imgRGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        imgRGB = np.ascontiguousarray(imgRGB)
-
-        # Pad to square (letterbox) for more stable landmark projection.
-        h, w = imgRGB.shape[:2]
-        size = max(h, w)
-        if h != w:
-            pad_y = (size - h) // 2
-            pad_x = (size - w) // 2
-            square = np.zeros((size, size, 3), dtype=imgRGB.dtype)
-            square[pad_y:pad_y + h, pad_x:pad_x + w] = imgRGB
-            imgRGB_for_mp = square
-            self._pad_size = size
-            self._pad_x = pad_x
-            self._pad_y = pad_y
-        else:
-            imgRGB_for_mp = imgRGB
-            self._pad_size = size
-            self._pad_x = 0
-            self._pad_y = 0
         self.last_error = None
 
         if self._tasks_detector is not None:
             try:
-                mp_image = mp.Image.create_from_numpy_array(imgRGB_for_mp)
-            except Exception:
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=imgRGB_for_mp)
-            try:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=imgRGB)
                 self.results = self._tasks_detector.detect(mp_image)
             except Exception as e:
                 self.last_error = str(e)
@@ -99,36 +79,28 @@ class handDetector():
         return img
 
     def findPosition(self, img, handNo=0, draw=True, drawBbox=False):   # Fetches the position of hands
-        xList = []
-        yList = []
         bbox = []
         self.lmList = []
         self.handedness = None
         if img is None:
             return self.lmList, bbox
-        h, w, c = img.shape
-        pad_size = self._pad_size or max(h, w)
-        pad_x = self._pad_x
-        pad_y = self._pad_y
-        if self.results and self.results.hand_landmarks:
-            hands = self.results.hand_landmarks
+        h, w = img.shape[:2]
+        results = getattr(self, "results", None)
+        if results and getattr(results, "hand_landmarks", None):
+            hands = results.hand_landmarks
             if handNo < len(hands):
                 hand = hands[handNo]
 
-                handedness_all = getattr(self.results, "handedness", None)
+                handedness_all = getattr(results, "handedness", None)
                 if handedness_all and handNo < len(handedness_all) and handedness_all[handNo]:
                     # Typical structure: List[List[Category]]; pick top label.
                     self.handedness = getattr(handedness_all[handNo][0], "category_name", None) or getattr(
                         handedness_all[handNo][0], "display_name", None
                     )
-                # Pre-calculate cx, cy to avoid redundant operations
+                # Direct normalized coordinate projection without padding overhead
                 for id, lm in enumerate(hand):
-                    # Landmarks are normalized to the image passed into MediaPipe.
-                    # We may have letterboxed to a square; map back to original frame.
-                    x_pad = lm.x * pad_size
-                    y_pad = lm.y * pad_size
-                    cx = int(x_pad - pad_x)
-                    cy = int(y_pad - pad_y)
+                    cx = int(lm.x * w)
+                    cy = int(lm.y * h)
                     cx = max(0, min(w - 1, cx))
                     cy = max(0, min(h - 1, cy))
                     self.lmList.append([id, cx, cy])
@@ -155,31 +127,32 @@ class handDetector():
                     for id, cx, cy in self.lmList:
                         cv2.circle(img, (cx, cy), 5, (0, 0, 255), cv2.FILLED)
                 
-                if drawBbox:
+                if len(self.lmList) > 0:
                     xList = [lm[1] for lm in self.lmList]
                     yList = [lm[2] for lm in self.lmList]
                     xmin, xmax = min(xList), max(xList)
                     ymin, ymax = min(yList), max(yList)
-                    bbox = xmin, ymin, xmax, ymax
-                    cv2.rectangle(img, (xmin - 20, ymin - 20), (xmax + 20, ymax + 20),
-                                  (0, 255, 0), 2)
+                    bbox = (xmin, ymin, xmax, ymax)
+                    if drawBbox:
+                        cv2.rectangle(img, (xmin - 20, ymin - 20), (xmax + 20, ymax + 20),
+                                      (0, 255, 0), 2)
         return self.lmList, bbox
 
     def fingersUp(self):    # Checks which fingers are up
         if not self.lmList or len(self.lmList) < 21:
             return [0, 0, 0, 0, 0]
         fingers = []
-        # Thumb: use handedness to decide x-direction.
-        # For a non-mirrored image: Right-hand thumb extends to the left (smaller x), Left-hand thumb extends to the right.
+        # Thumb: In a mirrored (flipped) image, Right hand thumb extends to the right (larger x),
+        # and Left hand thumb extends to the left (smaller x).
         thumb_tip_x = self.lmList[self.tipIds[0]][1]
-        thumb_ip_x = self.lmList[self.tipIds[0] - 1][1]
+        thumb_mcp_x = self.lmList[2][1]
         if self.handedness == "Right":
-            fingers.append(1 if thumb_tip_x < thumb_ip_x else 0)
+            fingers.append(1 if thumb_tip_x > thumb_mcp_x else 0)
         elif self.handedness == "Left":
-            fingers.append(1 if thumb_tip_x > thumb_ip_x else 0)
+            fingers.append(1 if thumb_tip_x < thumb_mcp_x else 0)
         else:
-            # Fallback when handedness isn't available.
-            fingers.append(1 if thumb_tip_x > thumb_ip_x else 0)
+            # Fallback when handedness isn't available
+            fingers.append(1 if thumb_tip_x > thumb_mcp_x else 0)
 
         # Fingers: check if tip is above pip joint (y-coordinate is smaller)
         for id in range(1, 5):
